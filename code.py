@@ -68,8 +68,16 @@ def dump_package(buf: bytes, end: int, prefix: str = ""):
         # 12+n Data Exchange Receive Bit Rate
         # 13+n #Activation Parameters
         #      Activation Parameters
-        print("{}RF_INTF_ACTIVATED_NTF({}) ID: {} Interface: {} Protocol: {} Mode: 0x{:02x}".format(
-            prefix, end, buf[3], buf[4], buf[5], buf[6]))
+        print("{}RF_INTF_ACTIVATED_NTF({}) ID: {} Interface: {}{} Protocol: {}{} Mode: 0x{:02x}{} Max PL: {} Credits: {} RFTS length: {}".format(
+            prefix, end, buf[3]
+            , buf[4], " (Frame RF Interface)"      if buf[4] == 0x01 else ""
+            , buf[5], " (PROTOCOL_T2T)"            if buf[5] == 0x02 else ""
+            , buf[6], " (NFC_A_PASSIVE_POLL_MODE)" if buf[6] == 0x00 else ""
+            , buf[7], buf[8], buf[9]))
+        for i in range(buf[9]):
+            print("{}RF_INTF_ACTIVATED_NTF({}) RFTS[{:02}]: {}".format(prefix, end, i, buf[2+7+i+1]))
+        de_offset=2+7+buf[9]+1
+        print("{}RF_INTF_ACTIVATED_NTF({}) DE Mode: {} DE TX rate: {} DE RX rate: {} DE Act. Params: {}".format(prefix, end, buf[de_offset], buf[de_offset+1], buf[de_offset+2], buf[de_offset+3]))
     elif fst == 0x2f and snd == 0x02:
         print("{}PROPRIETARY_ACT_CMD({})".format(prefix, end))
     elif fst == 0x4f and snd == 0x02:
