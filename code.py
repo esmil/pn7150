@@ -1,10 +1,33 @@
 import board
+import time
 from supervisor import ticks_ms
 from time import sleep
 from digitalio import DigitalInOut, Pull
 from busio import I2C
 
 _TICKS_PERIOD = const(1<<29)
+
+# NCI protocol definitions
+
+# Header Message Type (MT) & Packet Boundary Flag (PBF)
+# byte 0, MSB nibble
+_HEADER_PBF_SEG_MASK     = const(0x10)
+_HEADER_MT_CTRL_DATA     = const(0x00)
+_HEADER_MT_CTRL_DATA_SEG = _HEADER_MT_CTRL_DATA &  _HEADER_PBF_SEG_MASK
+_HEADER_MT_CTRL_REQ      = const(0x20)
+_HEADER_MT_CTRL_REQ_SEG  = _HEADER_MT_CTRL_DATA & _HEADER_PBF_SEG_MASK
+_HEADER_MT_CTRL_RSP      = const(0x40)
+_HEADER_MT_CTRL_RSP_SEG  = _HEADER_MT_CTRL_RSP & _HEADER_PBF_SEG_MASK
+
+# Group Identifier (GID) for control packets
+# byte 0, LSB nibble
+_GID_CORE = const(0x00)
+_GID_RF   = const(0x01)
+
+# Opcode Identifier for control packets
+# byte 1, 6 LSBs
+_OID_RF_DISCOVER_MAP = const(0x00)
+_OID_RF_DISCOVER     = const(0x03)
 
 _STATUS_OK       = const(0x00)
 _STATUS_REJECTED = const(0x01)
@@ -74,9 +97,13 @@ def dump_package(buf: bytes, end: int, prefix: str = ""):
             , buf[5], " (PROTOCOL_T2T)"            if buf[5] == 0x02 else ""
             , buf[6], " (NFC_A_PASSIVE_POLL_MODE)" if buf[6] == 0x00 else ""
             , buf[7], buf[8], buf[9]))
-        for i in range(buf[9]):
-            print("{}RF_INTF_ACTIVATED_NTF({}) RFTS[{:02}]: {}".format(prefix, end, i, buf[2+7+i+1]))
-        de_offset=2+7+buf[9]+1
+        rtfs_length = buf[9]
+        rfts_offset = 9+1
+        # dump raw rfts
+        for i in range(rtfs_length):
+            print("{}RF_INTF_ACTIVATED_NTF({}) RFTS[{:02}]: {}".format(prefix, end, i, buf[rfts_offset+i]))
+        # dump DE
+        de_offset = 9+rtfs_length+1
         print("{}RF_INTF_ACTIVATED_NTF({}) DE Mode: {} DE TX rate: {} DE RX rate: {} DE Act. Params: {}".format(prefix, end, buf[de_offset], buf[de_offset+1], buf[de_offset+2], buf[de_offset+3]))
     elif fst == 0x2f and snd == 0x02:
         print("{}PROPRIETARY_ACT_CMD({})".format(prefix, end))
@@ -152,7 +179,6 @@ class PN7150:
         if (end < 6 or self._buf[0] != 0x40 or self._buf[1] != 0x00
                 or self._buf[3] != _STATUS_OK or self._buf[5] != 0x01):
             return False
-
         self._write(NCI_CORE_INIT_CMD)
         end = self._read()
         if end < 20 or self._buf[0] != 0x40 or self._buf[1] != 0x01 or self._buf[3] != _STATUS_OK:
@@ -160,15 +186,16 @@ class PN7150:
 
         nRFInt = self._buf[8]
         self.fw_version = self._buf[17 + nRFInt:20 + nRFInt]
-        print("Firmware version: 0x{:02x} 0x{:02x} 0x{:02x}".format(
-            self.fw_version[0], self.fw_version[1], self.fw_version[2]))
+        if debug:
+            print("Firmware version: 0x{:02x} 0x{:02x} 0x{:02x}".format(
+                self.fw_version[0], self.fw_version[1], self.fw_version[2]))
 
         self._write(NCI_PROP_ACT_CMD)
         end = self._read()
         if end < 4 or self._buf[0] != 0x4F or self._buf[1] != 0x02 or self._buf[3] != _STATUS_OK:
             return False
-
-        print("FW_Build_Number:", self._buf[4:8])
+        if debug:
+            print("FW_Build_Number:", self._buf[4:8])
 
         return True
 
@@ -185,14 +212,14 @@ class PN7150:
         self._write(NCI_RF_DISCOVER_MAP_RW)
         end = self._read(10)
         self._i2c.unlock()
-        return end >= 4 and self._buf[0] == 0x41 and self._buf[1] == 0x00 and self._buf[3] == _STATUS_OK
+        return end >= 4 and (self._buf[0] & 0xf0) == _HEADER_MT_CTRL_RSP and (self._buf[0] & 0x0f) == _GID_RF and self._buf[1] == _OID_RF_DISCOVER_MAP and self._buf[3] == _STATUS_OK
 
     def startDiscoveryRW(self):
         assert self._i2c.try_lock()
         self._write(NCI_RF_DISCOVER_CMD_RW)
         end = self._read()
         self._i2c.unlock()
-        return end >= 4 and self._buf[0] == 0x41 and self._buf[1] == 0x03 and self._buf[3] == _STATUS_OK 
+        return end >= 4 and (self._buf[0] & 0xf0) == _HEADER_MT_CTRL_RSP and (self._buf[0] & 0x0f) == _GID_RF and self._buf[1] == _OID_RF_DISCOVER and (self._buf[3] == _STATUS_OK)
 
     def waitForDiscovery(self):
         assert self._i2c.try_lock()
@@ -200,7 +227,24 @@ class PN7150:
         while end == 0:
             end = self._read()
         self._i2c.unlock()
-        return True
+        return self.decodeID()
+
+    def decodeID(self):
+        # decode NFCID1 of rfts for NFC_A_PASSIVE_POLL_MODE
+        if self._buf[6] == 0x00:
+            rfts_offset = 9+1
+            nfcid1_length = self._buf[rfts_offset+2]
+            if nfcid1_length > 0:
+                id_string=""
+                id_byte=[]
+                for id_byte_offset in range(nfcid1_length):
+                    id_string += "{}{:02x}".format(":" if id_byte_offset>0 else "", self._buf[rfts_offset+3+id_byte_offset])
+                    id_byte.append(self._buf[rfts_offset+3+id_byte_offset])
+            else:
+                return {"string":"unexpected ID length of 0", "error":True}
+        else:
+            return {"string":"unsupported RF Technology and Mode 0x{:02x}".format(self._buf[6]), "error":True}
+        return {"integer":id_byte, "string":id_string, "error":False}
 
 class NT3H2:
     def __init__(self, i2c: I2C, addr: int = 0x55):
@@ -238,18 +282,31 @@ if __name__ == '__main__':
         #nt = NT3H2(i2c)
         #nt.readpage(0)
         #nt.readpage(58)
+        debug=False
+        nfc = PN7150(i2c, board.IRQ, board.VEN, debug=debug)
 
-        nfc = PN7150(i2c, board.IRQ, board.VEN, debug=True)
+        while True:
+            print("\n------ Waiting for NFC tag proximity ------")
+            assert nfc.connect()
+            if debug:
+                print("Connected.")
 
-        assert nfc.connect()
-        print("Connected.")
+            assert nfc.modeRW()
+            if debug:
+                print("Switched to read/write mode.")
 
-        assert nfc.modeRW()
-        print("Switched to read/write mode.")
+            assert nfc.startDiscoveryRW()
+            if debug:
+                print("Started read/write discovery.")
 
-        assert nfc.startDiscoveryRW()
-        print("Started read/write discovery.")
-
-        nfc.waitForDiscovery()
+            id = nfc.waitForDiscovery()
+            if not id["error"]:
+                if not debug:
+                    print("Saw NFC tag with ID: {}".format(id["string"]))
+                else:
+                    print("NFCID1 of NFC_A_PASSIVE_POLL_MODE tag: {}".format(id["string"]))
+            else:
+                print("Error decoding NFC tag ID: {}".format(id["string"]))
+            time.sleep(1) # wait for tag to be removed to prevent interrupted disc.
     finally:
         i2c.deinit()
