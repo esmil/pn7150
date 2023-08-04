@@ -102,16 +102,6 @@ def dump_package(buf: bytes, end: int, prefix: str = ""):
         # dump raw rfts
         for i in range(rtfs_length):
             print("{}RF_INTF_ACTIVATED_NTF({}) RFTS[{:02}]: {}".format(prefix, end, i, buf[rfts_offset+i]))
-        # decode NFCID1 of rfts for NFC_A_PASSIVE_POLL_MODE
-        if buf[6] == 0x00:
-            nfcid1_length = buf[rfts_offset+2]
-            print("  NFCID1 Length: {}".format(nfcid1_length))
-            if nfcid1_length > 0:
-                print("  NFCID1: ",end="")
-                for id_byte_offset in range(nfcid1_length):
-                    id_byte = "{}{:02x}".format(":" if id_byte_offset>0 else "", buf[rfts_offset+3+id_byte_offset])
-                    print(id_byte, end="")
-                print("")
         # dump DE
         de_offset = 9+rtfs_length+1
         print("{}RF_INTF_ACTIVATED_NTF({}) DE Mode: {} DE TX rate: {} DE RX rate: {} DE Act. Params: {}".format(prefix, end, buf[de_offset], buf[de_offset+1], buf[de_offset+2], buf[de_offset+3]))
@@ -196,15 +186,16 @@ class PN7150:
 
         nRFInt = self._buf[8]
         self.fw_version = self._buf[17 + nRFInt:20 + nRFInt]
-        print("Firmware version: 0x{:02x} 0x{:02x} 0x{:02x}".format(
-            self.fw_version[0], self.fw_version[1], self.fw_version[2]))
+        if debug:
+            print("Firmware version: 0x{:02x} 0x{:02x} 0x{:02x}".format(
+                self.fw_version[0], self.fw_version[1], self.fw_version[2]))
 
         self._write(NCI_PROP_ACT_CMD)
         end = self._read()
         if end < 4 or self._buf[0] != 0x4F or self._buf[1] != 0x02 or self._buf[3] != _STATUS_OK:
             return False
-
-        print("FW_Build_Number:", self._buf[4:8])
+        if debug:
+            print("FW_Build_Number:", self._buf[4:8])
 
         return True
 
@@ -236,7 +227,24 @@ class PN7150:
         while end == 0:
             end = self._read()
         self._i2c.unlock()
-        return end
+        return self.decodeID()
+
+    def decodeID(self):
+        # decode NFCID1 of rfts for NFC_A_PASSIVE_POLL_MODE
+        if self._buf[6] == 0x00:
+            rfts_offset = 9+1
+            nfcid1_length = self._buf[rfts_offset+2]
+            if nfcid1_length > 0:
+                id_string=""
+                id_byte=[]
+                for id_byte_offset in range(nfcid1_length):
+                    id_string += "{}{:02x}".format(":" if id_byte_offset>0 else "", self._buf[rfts_offset+3+id_byte_offset])
+                    id_byte.append(self._buf[rfts_offset+3+id_byte_offset])
+            else:
+                return {"string":"unexpected ID length of 0", "error":True}
+        else:
+            return {"string":"unsupported RF Technology and Mode 0x{:02x}".format(self._buf[6]), "error":True}
+        return {"integer":id_byte, "string":id_string, "error":False}
 
 class NT3H2:
     def __init__(self, i2c: I2C, addr: int = 0x55):
@@ -274,21 +282,31 @@ if __name__ == '__main__':
         #nt = NT3H2(i2c)
         #nt.readpage(0)
         #nt.readpage(58)
-
-        nfc = PN7150(i2c, board.IRQ, board.VEN, debug=True)
+        debug=False
+        nfc = PN7150(i2c, board.IRQ, board.VEN, debug=debug)
 
         while True:
-            print("\n------ Initiating NFC discovery ------")
+            print("\n------ Waiting for NFC tag proximity ------")
             assert nfc.connect()
-            print("Connected.")
+            if debug:
+                print("Connected.")
 
             assert nfc.modeRW()
-            print("Switched to read/write mode.")
+            if debug:
+                print("Switched to read/write mode.")
 
             assert nfc.startDiscoveryRW()
-            print("Started read/write discovery.")
+            if debug:
+                print("Started read/write discovery.")
 
-            nfc.waitForDiscovery()
-            time.sleep(2)
+            id = nfc.waitForDiscovery()
+            if not id["error"]:
+                if not debug:
+                    print("Saw NFC tag with ID: {}".format(id["string"]))
+                else:
+                    print("NFCID1 of NFC_A_PASSIVE_POLL_MODE tag: {}".format(id["string"]))
+            else:
+                print("Error decoding NFC tag ID: {}".format(id["string"]))
+            time.sleep(1) # wait for tag to be removed to prevent interrupted disc.
     finally:
         i2c.deinit()
